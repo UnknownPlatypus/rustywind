@@ -162,6 +162,33 @@ const VARIANT_HEAVY_CLASS_SET: &[&str] = &[
     "dark:bg-gray-800",
 ];
 
+// A realistic component mixing recognized Tailwind utilities with project
+// specific / custom classes (icon fonts, BEM-style component classes). The
+// custom classes have no sort key, exercising the negative-cache path that a
+// real template hits when the same custom classes recur across many elements.
+const CUSTOM_HEAVY_CLASS_SET: &[&str] = &[
+    "icon",
+    "icon-check",
+    "icon-lg",
+    "btn",
+    "btn-primary",
+    "card",
+    "card-body",
+    "badge",
+    "badge-success",
+    "nav-link",
+    "dropdown-menu",
+    "tooltip-inner",
+    "flex",
+    "items-center",
+    "gap-2",
+    "p-4",
+    "text-sm",
+    "rounded-lg",
+    "bg-white",
+    "shadow-md",
+];
+
 fn bench_get_sort_key(c: &mut Criterion) {
     let sorter = HybridSorter::new();
 
@@ -186,6 +213,7 @@ fn bench_sort_classes(c: &mut Criterion) {
         ("medium_25", MEDIUM_CLASS_SET),
         ("large_80", LARGE_CLASS_SET),
         ("variant_heavy_25", VARIANT_HEAVY_CLASS_SET),
+        ("custom_heavy_20", CUSTOM_HEAVY_CLASS_SET),
     ] {
         group.bench_with_input(
             BenchmarkId::from_parameter(name),

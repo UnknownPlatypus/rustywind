@@ -40,8 +40,10 @@ pub struct HybridSorter {
     /// Capacity: DEFAULT_CACHE_SIZE entries (covers most real-world usage)
     /// Uses CompactString keys for memory efficiency (24 bytes inline, no heap for typical classes)
     /// Stores keys behind an [`Arc`] so cache hits don't deep-clone the key's
-    /// several `Vec` fields.
-    cache: Arc<Cache<compact_str::CompactString, Arc<SortKey>>>,
+    /// several `Vec` fields. The value is `Option` so unrecognized classes are
+    /// cached as `None` -- a recurring custom class (e.g. `icon-check`) is then
+    /// parsed once instead of on every occurrence.
+    cache: Arc<Cache<compact_str::CompactString, Option<Arc<SortKey>>>>,
 }
 
 impl HybridSorter {
@@ -107,16 +109,17 @@ impl HybridSorter {
         // tier 1: check LRU cache for previously computed classes (fast)
         // CompactString has efficient conversion from &str
         let class_compact = compact_str::CompactString::new(class);
-        if let Some(cached_key) = self.cache.get(&class_compact) {
-            return Some(cached_key);
+        if let Some(cached) = self.cache.get(&class_compact) {
+            // hit, positive or negative: an unrecognized class is cached as
+            // None so recurring custom classes aren't re-parsed every time
+            return cached;
         }
 
-        // tier 2: compute using pattern sorter and cache the result
+        // tier 2: compute using pattern sorter and cache the result (Some or None)
         // CompactString stores most classes inline (24 bytes) avoiding heap allocations
-        let sort_key = Arc::new(self.pattern_sorter.get_sort_key(class)?);
-        self.cache
-            .insert(sort_key.class.clone(), Arc::clone(&sort_key));
-        Some(sort_key)
+        let sort_key = self.pattern_sorter.get_sort_key(class).map(Arc::new);
+        self.cache.insert(class_compact, sort_key.clone());
+        sort_key
     }
 
     /// Sort a list of Tailwind CSS classes according to the canonical ordering
