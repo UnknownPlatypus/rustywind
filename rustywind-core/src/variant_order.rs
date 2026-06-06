@@ -15,6 +15,9 @@
 //! their modifier. This matches Tailwind's behavior where `peer-hover` comes
 //! before `peer-focus` because `hover` comes before `focus`.
 
+use ahash::AHashMap as HashMap;
+use std::sync::LazyLock;
+
 /// The canonical order of variants from Tailwind CSS.
 ///
 /// Variants are listed in the order they should appear in sorted output.
@@ -293,6 +296,19 @@ fn bracket_inner(value: &str) -> Option<&str> {
     value.strip_prefix('[')?.split(']').next()
 }
 
+/// Maps each canonical variant name to its index for O(1) lookup.
+///
+/// Replaces repeated linear scans over [`VARIANT_ORDER`]; `get_variant_index`
+/// is called many times per comparison while sorting, so the linear scans
+/// showed up as a hot spot.
+static VARIANT_INDEX_MAP: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    VARIANT_ORDER
+        .iter()
+        .enumerate()
+        .map(|(idx, &variant)| (variant, idx))
+        .collect()
+});
+
 /// Get the index of a variant in the canonical order.
 ///
 /// Returns `Some(index)` if the variant is found, or `None` if it's not in the list.
@@ -321,63 +337,45 @@ fn bracket_inner(value: &str) -> Option<&str> {
 pub fn get_variant_index(variant: &str) -> Option<usize> {
     let variant = variant.split_once('/').map_or(variant, |(base, _)| base);
 
-    if let Some(index) = VARIANT_ORDER.iter().position(|&v| v == variant) {
+    if let Some(&index) = VARIANT_INDEX_MAP.get(variant) {
         return Some(index);
     }
 
-    if variant.starts_with("group-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "group");
-    }
+    // Compound and dynamic variants sort at their base variant's position
+    // (e.g. `group-hover` sorts at `group`, `data-[...]` sorts at `data`).
+    // The order of these checks matters: longer `nth-*` prefixes must be
+    // tested before their shorter counterparts.
+    let base = if variant.starts_with("group-") {
+        "group"
+    } else if variant.starts_with("peer-") {
+        "peer"
+    } else if variant.starts_with("not-") {
+        "not"
+    } else if variant.starts_with("max-[") {
+        "max-[]"
+    } else if variant.starts_with("min-[") {
+        "min-[]"
+    } else if variant.starts_with("in-") {
+        "in"
+    } else if variant.starts_with("has-") {
+        "has"
+    } else if variant.starts_with("aria-") {
+        "aria"
+    } else if variant.starts_with("data-") {
+        "data"
+    } else if variant.starts_with("nth-last-of-type-") {
+        "nth-last-of-type"
+    } else if variant.starts_with("nth-of-type-") {
+        "nth-of-type"
+    } else if variant.starts_with("nth-last-") {
+        "nth-last"
+    } else if variant.starts_with("nth-") {
+        "nth"
+    } else {
+        return None;
+    };
 
-    if variant.starts_with("peer-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "peer");
-    }
-
-    if variant.starts_with("not-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "not");
-    }
-
-    if variant.starts_with("max-[") {
-        return VARIANT_ORDER.iter().position(|&v| v == "max-[]");
-    }
-
-    if variant.starts_with("min-[") {
-        return VARIANT_ORDER.iter().position(|&v| v == "min-[]");
-    }
-
-    if variant.starts_with("in-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "in");
-    }
-
-    if variant.starts_with("has-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "has");
-    }
-
-    if variant.starts_with("aria-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "aria");
-    }
-
-    if variant.starts_with("data-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "data");
-    }
-
-    if variant.starts_with("nth-last-of-type-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "nth-last-of-type");
-    }
-
-    if variant.starts_with("nth-of-type-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "nth-of-type");
-    }
-
-    if variant.starts_with("nth-last-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "nth-last");
-    }
-
-    if variant.starts_with("nth-") {
-        return VARIANT_ORDER.iter().position(|&v| v == "nth");
-    }
-
-    None
+    VARIANT_INDEX_MAP.get(base).copied()
 }
 
 /// Parse a list of variant strings into structured variant infos.
