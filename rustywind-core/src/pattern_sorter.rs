@@ -44,20 +44,22 @@ fn has_bare_group_or_peer(variant_chain: &[VariantInfo]) -> bool {
         .any(|v| (v.base == "group" || v.base == "peer") && v.modifier.is_none())
 }
 
-fn compare_selector_dynamic_sequences(a: &[VariantInfo], z: &[VariantInfo]) -> Ordering {
-    let a_sequence = selector_dynamic_sequence(a);
-    let z_sequence = selector_dynamic_sequence(z);
-
+fn compare_selector_dynamic_sequences(
+    a_sequence: &[SelectorDynamicKeyOwned],
+    z_sequence: &[SelectorDynamicKeyOwned],
+    a: &[VariantInfo],
+    z: &[VariantInfo],
+) -> Ordering {
     if a_sequence.is_empty() || z_sequence.is_empty() {
         return Ordering::Equal;
     }
 
     let first_difference = first_variant_difference_index(a, z);
-    if first_difference < a_sequence[0].0 || first_difference < z_sequence[0].0 {
+    if first_difference < a_sequence[0].index || first_difference < z_sequence[0].index {
         return Ordering::Equal;
     }
 
-    compare_selector_dynamic_keys(&a_sequence, &z_sequence)
+    compare_selector_dynamic_keys(a_sequence, z_sequence)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,18 @@ struct SelectorDynamicKey<'a> {
     modifier_kind: u8,
     value_kind: u8,
     value: &'a str,
+}
+
+/// Owned, precomputed form of [`SelectorDynamicKey`] stored on [`SortKey`] so
+/// comparisons never have to re-parse the variant chain.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SelectorDynamicKeyOwned {
+    /// Position of this variant within the original variant chain.
+    index: usize,
+    kind: u8,
+    modifier_kind: u8,
+    value_kind: u8,
+    value: compact_str::CompactString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,10 +99,10 @@ fn first_variant_difference_index(a: &[VariantInfo], z: &[VariantInfo]) -> usize
 }
 
 fn compare_selector_dynamic_keys(
-    a: &[(usize, SelectorDynamicKey<'_>)],
-    z: &[(usize, SelectorDynamicKey<'_>)],
+    a: &[SelectorDynamicKeyOwned],
+    z: &[SelectorDynamicKeyOwned],
 ) -> Ordering {
-    for ((_, a_key), (_, z_key)) in a.iter().zip(z.iter()) {
+    for (a_key, z_key) in a.iter().zip(z.iter()) {
         if a_key.kind != z_key.kind {
             return Ordering::Equal;
         }
@@ -97,7 +111,7 @@ fn compare_selector_dynamic_keys(
             .modifier_kind
             .cmp(&z_key.modifier_kind)
             .then_with(|| a_key.value_kind.cmp(&z_key.value_kind))
-            .then_with(|| compare_alphanumeric(a_key.value, z_key.value))
+            .then_with(|| compare_alphanumeric(&a_key.value, &z_key.value))
         {
             Ordering::Equal => continue,
             other => return other,
@@ -107,13 +121,19 @@ fn compare_selector_dynamic_keys(
     a.len().cmp(&z.len())
 }
 
-fn selector_dynamic_sequence(
-    variant_chain: &[VariantInfo],
-) -> Vec<(usize, SelectorDynamicKey<'_>)> {
+fn selector_dynamic_sequence(variant_chain: &[VariantInfo]) -> Vec<SelectorDynamicKeyOwned> {
     variant_chain
         .iter()
         .enumerate()
-        .filter_map(|(index, variant)| selector_dynamic_key(variant).map(|key| (index, key)))
+        .filter_map(|(index, variant)| {
+            selector_dynamic_key(variant).map(|key| SelectorDynamicKeyOwned {
+                index,
+                kind: key.kind,
+                modifier_kind: key.modifier_kind,
+                value_kind: key.value_kind,
+                value: compact_str::CompactString::new(key.value),
+            })
+        })
         .collect()
 }
 
@@ -238,9 +258,7 @@ fn arbitrary_variant_key(value: &str) -> ArbitraryVariantKey {
     ArbitraryVariantKey { kind, selector }
 }
 
-fn compare_variant_masks(a: &[VariantInfo], z: &[VariantInfo]) -> Ordering {
-    let a_components = variant_mask_components(a);
-    let z_components = variant_mask_components(z);
+fn compare_variant_masks(a_components: &[VariantInfo], z_components: &[VariantInfo]) -> Ordering {
     let mut a_iter = a_components.iter().rev();
     let mut z_iter = z_components.iter().rev();
 
@@ -257,8 +275,8 @@ fn compare_variant_masks(a: &[VariantInfo], z: &[VariantInfo]) -> Ordering {
     }
 }
 
-fn variant_mask_components(variant_chain: &[VariantInfo]) -> Vec<&VariantInfo> {
-    let mut components: Vec<_> = variant_chain.iter().collect();
+fn variant_mask_components(variant_chain: &[VariantInfo]) -> Vec<VariantInfo> {
+    let mut components = variant_chain.to_vec();
     components.sort_by(|a, z| a.cmp_variants(z));
     components.dedup_by(|a, z| a.cmp_variants(z) == Ordering::Equal);
     components
@@ -510,7 +528,13 @@ fn extract_numeric_value(utility: &str) -> Option<f64> {
 /// This struct encapsulates all the information needed to sort a class according
 /// to Tailwind's algorithm. It implements `Ord` to provide the exact comparison
 /// logic used by Tailwind CSS.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Every field that the comparison needs is computed once, up front, in
+/// [`PatternSorter::get_sort_key`] (the "decorate" half of a
+/// decorate-sort-undecorate). [`Ord::cmp`] then only reads these fields: it
+/// performs no string re-parsing and no allocation, so a single comparison is
+/// cheap even though it is run `O(n log n)` times per sort.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SortKey {
     /// Variant order as bitwise flags (0 for no variants)
     pub variant_order: u128,
@@ -519,10 +543,18 @@ pub struct SortKey {
     /// This is used to properly sort compound variants like peer-hover vs peer-focus
     pub variant_chain: Vec<VariantInfo>,
 
-    /// Arbitrary variant selectors for tiebreaking when variant_order is equal
-    /// e.g., for `[&.x]:block` this would be `["[&.x]"]`
-    /// Used to sort different arbitrary variants lexicographically (with `_` decoded as space)
-    pub arbitrary_variants: Vec<compact_str::CompactString>,
+    /// Precomputed sorted + deduplicated variant components, compared as a
+    /// "mask" when neither class has arbitrary variants.
+    variant_mask: Vec<VariantInfo>,
+
+    /// Precomputed selector-dynamic key sequence (for `data-`/`has-`/`aria-`/
+    /// `nth-`/`in-` style variants).
+    selector_dynamic_seq: Vec<SelectorDynamicKeyOwned>,
+
+    /// Precomputed sort keys for arbitrary variant selectors, e.g. `[&.x]`.
+    /// Used to sort different arbitrary variants lexicographically (with `_`
+    /// decoded as space).
+    arbitrary_variant_keys: Vec<ArbitraryVariantKey>,
 
     /// Property indices from PROPERTY_ORDER (lower = earlier)
     /// When utilities have multiple properties (e.g., rounded-t), ALL property indices
@@ -547,6 +579,31 @@ pub struct SortKey {
     /// Whether this class is unparseable (e.g., bare group:/peer: without modifiers)
     /// Unparseable classes sort first (matching Prettier's behavior)
     pub is_unparseable: bool,
+
+    /// Precomputed `space-*`/`gap-*` tiebreak priority (see
+    /// [`get_utility_prefix_priority`]).
+    utility_prefix_priority: u32,
+
+    /// Precomputed color name for color utilities, used for the alphabetical
+    /// color tiebreak (e.g. `bg-blue-500` < `bg-red-50`).
+    color_name: Option<&'static str>,
+
+    /// Precomputed: whether the class carries an arbitrary value, e.g. `w-[5px]`.
+    has_arbitrary_value: bool,
+
+    /// Precomputed: whether the class uses opacity syntax, e.g. `bg-white/30`.
+    has_opacity_syntax: bool,
+
+    /// Precomputed: whether arbitrary values sort before keywords for this
+    /// utility (see [`should_arbitrary_come_first`]).
+    arbitrary_comes_first: bool,
+
+    /// Precomputed width/height base number for fraction/whole-number grouping.
+    base_number: Option<(i32, Option<i32>)>,
+
+    /// Precomputed base name with size modifiers stripped, for the alphabetical
+    /// tiebreak (see [`extract_base_name`]).
+    base_name: compact_str::CompactString,
 }
 
 impl Eq for SortKey {}
@@ -658,7 +715,7 @@ fn is_negative_value(class: &str) -> bool {
 ///
 /// This is used to ensure colors sort alphabetically by color name first,
 /// then by shade number when color names match (matching Prettier's behavior).
-fn extract_color_name(utility: &str) -> Option<&str> {
+fn extract_color_name(utility: &str) -> Option<&'static str> {
     // strip variants first to get just the utility part
     let utility_base = utility_part(utility);
 
@@ -731,10 +788,9 @@ fn extract_color_name(utility: &str) -> Option<&str> {
         // second part should be the color name
         let potential_color = parts[1];
 
-        // check if it's a known color name
-        if COLOR_NAMES.contains(&potential_color) {
-            return Some(potential_color);
-        }
+        // return the matching 'static color name so the result can be cached on
+        // the sort key without borrowing from `utility`
+        return COLOR_NAMES.iter().copied().find(|&c| c == potential_color);
     }
 
     None
@@ -853,9 +909,13 @@ impl Ord for SortKey {
 
         let self_has_arbitrary = self.variant_order & ARBITRARY_VARIANT_BIT != 0;
         let other_has_arbitrary = other.variant_order & ARBITRARY_VARIANT_BIT != 0;
-        let selector_dynamic_cmp =
-            compare_selector_dynamic_sequences(&self.variant_chain, &other.variant_chain);
-        let variant_mask_cmp = compare_variant_masks(&self.variant_chain, &other.variant_chain);
+        let selector_dynamic_cmp = compare_selector_dynamic_sequences(
+            &self.selector_dynamic_seq,
+            &other.selector_dynamic_seq,
+            &self.variant_chain,
+            &other.variant_chain,
+        );
+        let variant_mask_cmp = compare_variant_masks(&self.variant_mask, &other.variant_mask);
 
         // 2. compare by arbitrary variant presence and selectors
         // classes without arbitrary variants sort BEFORE classes with arbitrary variants
@@ -864,18 +924,11 @@ impl Ord for SortKey {
             (false, true) => return Ordering::Less, // no arbitrary before arbitrary
             (true, false) => return Ordering::Greater,
             (true, true) => {
-                // both have arbitrary variants - compare selectors FIRST
-                let a: Vec<_> = self
-                    .arbitrary_variants
-                    .iter()
-                    .map(|s| arbitrary_variant_key(s))
-                    .collect();
-                let b: Vec<_> = other
-                    .arbitrary_variants
-                    .iter()
-                    .map(|s| arbitrary_variant_key(s))
-                    .collect();
-                match a.cmp(&b) {
+                // both have arbitrary variants - compare precomputed selector keys FIRST
+                match self
+                    .arbitrary_variant_keys
+                    .cmp(&other.arbitrary_variant_keys)
+                {
                     Ordering::Equal => {
                         // same arbitrary selectors - compare known variant bits
                         // (mask out the arbitrary bit for comparison)
@@ -934,8 +987,9 @@ impl Ord for SortKey {
             .then_with(|| {
                 // only apply prefix priority when property indices are identical
                 if self.property_indices == other.property_indices {
-                    return get_utility_prefix_priority(&self.class)
-                        .cmp(&get_utility_prefix_priority(&other.class));
+                    return self
+                        .utility_prefix_priority
+                        .cmp(&other.utility_prefix_priority);
                 }
                 Ordering::Equal
             })
@@ -948,10 +1002,7 @@ impl Ord for SortKey {
             // this ensures bg-blue-500 comes before bg-red-50 (blue < red alphabetically)
             // rather than sorting by shade number (50 < 500)
             .then_with(|| {
-                match (
-                    extract_color_name(&self.class),
-                    extract_color_name(&other.class),
-                ) {
+                match (self.color_name, other.color_name) {
                     (Some(self_color), Some(other_color)) => {
                         // both are color utilities - compare by color name first
                         self_color.cmp(other_color)
@@ -985,11 +1036,11 @@ impl Ord for SortKey {
             // - z-40 z-[-1] → z-40 z-[-1] (non-arbitrary before arbitrary)
             // - w-full w-[50px] → w-[50px] w-full (for w-*, arbitrary before keyword)
             .then_with(|| {
-                // check arbitrary and opacity status
-                let self_has_arbitrary = has_arbitrary_value(&self.class);
-                let other_has_arbitrary = has_arbitrary_value(&other.class);
-                let self_has_opacity = has_opacity_syntax(&self.class);
-                let other_has_opacity = has_opacity_syntax(&other.class);
+                // check arbitrary and opacity status (precomputed)
+                let self_has_arbitrary = self.has_arbitrary_value;
+                let other_has_arbitrary = other.has_arbitrary_value;
+                let self_has_opacity = self.has_opacity_syntax;
+                let other_has_opacity = other.has_opacity_syntax;
 
                 // FIRST: check arbitrary vs non-arbitrary status
                 // fractions (w-1/2) are NOT arbitrary (no brackets)
@@ -1005,7 +1056,7 @@ impl Ord for SortKey {
                         } else {
                             // other is a keyword (w-full, w-auto, etc.)
                             // use property-specific rule for arbitrary vs keyword ordering
-                            if should_arbitrary_come_first(&self.class) {
+                            if self.arbitrary_comes_first {
                                 return Ordering::Less; // arbitrary BEFORE keyword (e.g., w-[50px] before w-full)
                             } else {
                                 return Ordering::Greater; // arbitrary AFTER keyword
@@ -1021,7 +1072,7 @@ impl Ord for SortKey {
                         } else {
                             // self is a keyword
                             // use property-specific rule for keyword vs arbitrary ordering
-                            if should_arbitrary_come_first(&other.class) {
+                            if other.arbitrary_comes_first {
                                 return Ordering::Greater; // keyword AFTER arbitrary
                             } else {
                                 return Ordering::Less; // keyword BEFORE arbitrary
@@ -1041,8 +1092,8 @@ impl Ord for SortKey {
                 match (self.numeric_value, other.numeric_value) {
                     (Some(a), Some(b)) if self_has_opacity == other_has_opacity => {
                         // check if both are width/height utilities with base numbers
-                        let self_base = extract_base_number(&self.class);
-                        let other_base = extract_base_number(&other.class);
+                        let self_base = self.base_number;
+                        let other_base = other.base_number;
 
                         match (self_base, other_base) {
                             (
@@ -1101,8 +1152,9 @@ impl Ord for SortKey {
                 match (self.numeric_value, other.numeric_value) {
                     (Some(_), Some(_)) => {
                         // first check prefix priority (space-* before gap-*)
-                        let prefix_cmp = get_utility_prefix_priority(&self.class)
-                            .cmp(&get_utility_prefix_priority(&other.class));
+                        let prefix_cmp = self
+                            .utility_prefix_priority
+                            .cmp(&other.utility_prefix_priority);
                         if prefix_cmp != Ordering::Equal {
                             return prefix_cmp;
                         }
@@ -1115,15 +1167,11 @@ impl Ord for SortKey {
             })
             // then by utility prefix priority (space-* before gap-* when properties match)
             .then_with(|| {
-                get_utility_prefix_priority(&self.class)
-                    .cmp(&get_utility_prefix_priority(&other.class))
+                self.utility_prefix_priority
+                    .cmp(&other.utility_prefix_priority)
             })
-            // compare base names (extracts modifiers)
-            .then_with(|| {
-                let base_self = extract_base_name(&self.class);
-                let base_other = extract_base_name(&other.class);
-                base_self.cmp(base_other)
-            })
+            // compare base names (modifiers stripped, precomputed)
+            .then_with(|| self.base_name.cmp(&other.base_name))
             // finally alphabetically on full name
             .then(self.class.cmp(&other.class))
     }
@@ -1180,11 +1228,17 @@ impl PatternSorter {
 
         // extract arbitrary variants for lexicographic tiebreaking
         // these are variants that start with '[' (e.g., [&.htmx-request], [&>*])
-        let arbitrary_variants: Vec<compact_str::CompactString> = variants_left_to_right
+        // their sort keys are precomputed here so comparisons stay allocation-free
+        let arbitrary_variant_keys: Vec<ArbitraryVariantKey> = variants_left_to_right
             .iter()
             .filter(|v| v.starts_with('['))
-            .map(|v| compact_str::CompactString::new(*v))
+            .map(|v| arbitrary_variant_key(v))
             .collect();
+
+        // precompute the variant-mask and selector-dynamic representations so
+        // comparisons don't have to rebuild (sort + dedup) them from variant_chain
+        let variant_mask = variant_mask_components(&variant_chain);
+        let selector_dynamic_seq = selector_dynamic_sequence(&variant_chain);
 
         // get the CSS properties this utility generates
         let properties = parsed.get_properties()?;
@@ -1220,16 +1274,35 @@ impl PatternSorter {
         // check if this class contains bare group/peer variants (invalid in Tailwind)
         let is_unparseable = has_bare_group_or_peer(&variant_chain);
 
+        // precompute the remaining per-class comparison inputs so SortKey::cmp
+        // never has to re-parse the class string
+        let utility_prefix_priority = get_utility_prefix_priority(class);
+        let color_name = extract_color_name(class);
+        let has_arbitrary_value = has_arbitrary_value(class);
+        let has_opacity_syntax = has_opacity_syntax(class);
+        let arbitrary_comes_first = should_arbitrary_come_first(class);
+        let base_number = extract_base_number(class);
+        let base_name = compact_str::CompactString::new(extract_base_name(class));
+
         Some(SortKey {
             variant_order,
             variant_chain,
-            arbitrary_variants,
+            variant_mask,
+            selector_dynamic_seq,
+            arbitrary_variant_keys,
             property_indices,
             numeric_value,
             is_negative,
             property_count,
             class: class_compact,
             is_unparseable,
+            utility_prefix_priority,
+            color_name,
+            has_arbitrary_value,
+            has_opacity_syntax,
+            arbitrary_comes_first,
+            base_number,
+            base_name,
         })
     }
 }
@@ -1523,25 +1596,25 @@ mod tests {
         let key1 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "flex".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         let key2 = SortKey {
             variant_order: 1,
             variant_chain: parse_variants(&["md"]),
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "md:flex".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         // base class (variant_order=0) should come before variant class
@@ -1553,25 +1626,25 @@ mod tests {
         let key1 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![50],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "a".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         let key2 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "b".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         // lower property index comes first
@@ -1583,25 +1656,25 @@ mod tests {
         let key1 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "a".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         let key2 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 2,
             class: "b".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         // more properties come first (key2 has 2, key1 has 1, so key2 < key1)
@@ -1613,25 +1686,25 @@ mod tests {
         let key1 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "aaa".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         let key2 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "bbb".into(),
             is_unparseable: false,
+            ..Default::default()
         };
 
         // alphabetical tiebreaker
@@ -1758,24 +1831,24 @@ mod tests {
         let key1 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: Some(4.0),
             is_negative: false,
             property_count: 1,
             class: "p-4".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         let key2 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: Some(8.0),
             is_negative: false,
             property_count: 1,
             class: "p-8".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         assert!(key1 < key2);
 
@@ -1783,24 +1856,24 @@ mod tests {
         let key3 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: Some(50.0),
             is_negative: false,
             property_count: 1,
             class: "scale-50".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         let key4 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: Some(110.0),
             is_negative: false,
             property_count: 1,
             class: "scale-110".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         assert!(key3 < key4);
 
@@ -1808,24 +1881,24 @@ mod tests {
         let key5 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: Some(4.0),
             is_negative: false,
             property_count: 1,
             class: "p-4".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         let key6 = SortKey {
             variant_order: 0,
             variant_chain: vec![],
-            arbitrary_variants: vec![],
             property_indices: vec![100],
             numeric_value: None,
             is_negative: false,
             property_count: 1,
             class: "p-auto".into(),
             is_unparseable: false,
+            ..Default::default()
         };
         // They should differ only by alphabetical order
         assert!(key5 < key6); // "p-4" < "p-auto" alphabetically
