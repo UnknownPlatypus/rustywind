@@ -39,7 +39,9 @@ pub struct HybridSorter {
     /// LRU cache for dynamically computed sort keys
     /// Capacity: DEFAULT_CACHE_SIZE entries (covers most real-world usage)
     /// Uses CompactString keys for memory efficiency (24 bytes inline, no heap for typical classes)
-    cache: Arc<Cache<compact_str::CompactString, SortKey>>,
+    /// Stores keys behind an [`Arc`] so cache hits don't deep-clone the key's
+    /// several `Vec` fields.
+    cache: Arc<Cache<compact_str::CompactString, Arc<SortKey>>>,
 }
 
 impl HybridSorter {
@@ -94,6 +96,14 @@ impl HybridSorter {
     /// let key = sorter.get_sort_key("m-[10px]").unwrap();
     /// ```
     pub fn get_sort_key(&self, class: &str) -> Option<SortKey> {
+        self.get_sort_key_cached(class).map(|key| (*key).clone())
+    }
+
+    /// Like [`Self::get_sort_key`] but returns the shared [`Arc`] from the cache.
+    ///
+    /// Sorting compares keys through shared references, so a cache hit only
+    /// bumps a refcount instead of deep-cloning the key's several `Vec` fields.
+    fn get_sort_key_cached(&self, class: &str) -> Option<Arc<SortKey>> {
         // tier 1: check LRU cache for previously computed classes (fast)
         // CompactString has efficient conversion from &str
         let class_compact = compact_str::CompactString::new(class);
@@ -102,14 +112,11 @@ impl HybridSorter {
         }
 
         // tier 2: compute using pattern sorter and cache the result
-        if let Some(sort_key) = self.pattern_sorter.get_sort_key(class) {
-            // cache the computed result for future lookups
-            // CompactString stores most classes inline (24 bytes) avoiding heap allocations
-            self.cache.insert(sort_key.class.clone(), sort_key.clone());
-            return Some(sort_key);
-        }
-
-        None
+        // CompactString stores most classes inline (24 bytes) avoiding heap allocations
+        let sort_key = Arc::new(self.pattern_sorter.get_sort_key(class)?);
+        self.cache
+            .insert(sort_key.class.clone(), Arc::clone(&sort_key));
+        Some(sort_key)
     }
 
     /// Sort a list of Tailwind CSS classes according to the canonical ordering
@@ -139,11 +146,12 @@ impl HybridSorter {
         use std::cmp::Ordering;
 
         // pre-allocate with exact capacity to avoid reallocations
-        let mut with_keys: Vec<(Option<SortKey>, &str)> = Vec::with_capacity(classes.len());
+        // hold keys as Arcs so sort swaps move a pointer, not the whole key
+        let mut with_keys: Vec<(Option<Arc<SortKey>>, &str)> = Vec::with_capacity(classes.len());
 
         // generate sort keys for all classes
         for &class in classes {
-            with_keys.push((self.get_sort_key(class), class));
+            with_keys.push((self.get_sort_key_cached(class), class));
         }
 
         // sort by keys
